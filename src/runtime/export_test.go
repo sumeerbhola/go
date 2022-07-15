@@ -85,9 +85,9 @@ func GCMask(x any) (ret []byte) {
 
 func RunSchedLocalQueueTest() {
 	_p_ := new(p)
-	gs := make([]g, len(_p_.runq))
+	gs := make([]g, prunqlen)
 	Escape(gs) // Ensure gs doesn't move, since we use guintptrs
-	for i := 0; i < len(_p_.runq); i++ {
+	for i := 0; i < int(prunqlen); i++ {
 		if g, _ := runqget(_p_); g != nil {
 			throw("runq is not empty initially")
 		}
@@ -109,14 +109,14 @@ func RunSchedLocalQueueTest() {
 func RunSchedLocalQueueStealTest() {
 	p1 := new(p)
 	p2 := new(p)
-	gs := make([]g, len(p1.runq))
+	gs := make([]g, prunqlen)
 	Escape(gs) // Ensure gs doesn't move, since we use guintptrs
-	for i := 0; i < len(p1.runq); i++ {
+	for i := 0; i < int(prunqlen); i++ {
 		for j := 0; j < i; j++ {
 			gs[j].sig = 0
 			runqput(p1, &gs[j], false)
 		}
-		gp := runqsteal(p2, p1, true)
+		gp := runqsteal(p2, p1, true, regularGClass)
 		s := 0
 		if gp != nil {
 			s++

@@ -1312,9 +1312,18 @@ func gcBgMarkWorker() {
 					// everything out of the run
 					// queue so it can run
 					// somewhere else.
-					if drainQ, n := runqdrain(pp); n > 0 {
+					drainQs, n := runqdrain(pp)
+					total := uint32(0)
+					for i := range n {
+						total += n[i]
+					}
+					if total > 0 {
 						lock(&sched.lock)
-						globrunqputbatch(&drainQ, int32(n))
+						for i := range drainQs {
+							if n[i] > 0 {
+								globrunqputbatch(&drainQs[i], int32(n[i]), GClass(i))
+							}
+						}
 						unlock(&sched.lock)
 					}
 				}

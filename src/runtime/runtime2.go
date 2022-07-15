@@ -451,6 +451,7 @@ type g struct {
 	// without precise pointer information.
 	asyncSafePoint bool
 
+	gClass       GClass
 	paniconfault bool // panic (instead of crash) on unexpected fault address
 	gcscandone   bool // g has scanned stack; protected by _Gscan bit in status
 	throwsplit   bool // must not split stack
@@ -557,6 +558,8 @@ type m struct {
 	park          note
 	alllink       *m // on allm
 	schedlink     muintptr
+	// TODO(sumeer): is it reasonable to assume that locking a G to a M is not
+	// common, so we don't change anything here related to priority of the G?
 	lockedg       guintptr
 	createstack   [32]uintptr // stack that created this thread.
 	lockedExt     uint32      // tracking for external LockOSThread
@@ -599,6 +602,16 @@ type m struct {
 	locksHeld    [10]heldLockInfo
 }
 
+type GClass uint8
+
+const (
+	regularGClass GClass = 0
+	elasticGClass GClass = 1
+	numGClasses   GClass = 2
+)
+
+const prunqlen = uint32(len(p{}.runqstate[0].q))
+
 type p struct {
 	id          int32
 	status      uint32 // one of pidle/prunning/...
@@ -619,9 +632,12 @@ type p struct {
 	goidcacheend uint64
 
 	// Queue of runnable goroutines. Accessed without lock.
-	runqhead uint32
-	runqtail uint32
-	runq     [256]guintptr
+	runqstate [numGClasses]struct {
+		head uint32
+		tail uint32
+		q    [256]guintptr
+	}
+
 	// runnext, if non-nil, is a runnable G that was ready'd by
 	// the current G and should be run next instead of what's in
 	// runq if there's time remaining in the running G's time
@@ -783,9 +799,10 @@ type schedt struct {
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
 	// Global runnable queue.
-	runq     gQueue
-	runqsize int32
-
+	runqstate [numGClasses]struct {
+		q     gQueue
+		qsize int32
+	}
 	// disable controls selective disabling of the scheduler.
 	//
 	// Use schedEnableUser to control this.
@@ -794,8 +811,8 @@ type schedt struct {
 	disable struct {
 		// user disables scheduling of user goroutines.
 		user     bool
-		runnable gQueue // pending runnable Gs
-		n        int32  // length of runnable
+		runnable [numGClasses]gQueue // pending runnable Gs
+		n        int32               // length of runnable
 	}
 
 	// Global cache of dead G's.
@@ -1149,3 +1166,76 @@ var (
 
 // Must agree with internal/buildcfg.FramePointerEnabled.
 const framepointer_enabled = GOARCH == "amd64" || GOARCH == "arm64"
+
+// CockroachDB changes:
+//
+// CockroachDB has the goal to provide performance isolation via inter-tenant
+// fairness, and within a tenant prioritization. Currently, this is attempted
+// purely via admission control mechanisms that attempt to reduce queuing in
+// the goroutine scheduler (queue of runnable goroutines) by queuing outside,
+// in admission control queues. We have two classes of work: regular and
+// elastic, where the goal is that regular work should be able to saturate the
+// CPU. Elastic work is optional, and it is acceptable to not service any
+// elastic work if CPU utilization is "very high" (say > 95%). However, we
+// observe delays in scheduling runnable goroutines for regular traffic, that
+// exceed 20ms, even when the CPU utilization is < 80%. The changes here are a
+// prototype to attempt to reduce these delays while allowing CPU utilization
+// due to elastic work to exceed 90%. NB: elastic work could also be
+// characterized as latency-insensitive, and that is certainly true for our
+// case -- we use the term elastic because it is also acceptable for the
+// throughput of this work to be adjusted in order to utilize available
+// resources.
+//
+// We assume that we cannot make very extensive changes to the goroutine
+// scheduler in order to embed knowledge of tenants and fine-grained
+// priorities. This would be hard to maintain and introduce more complex
+// data-structures (like heaps) into the scheduler.
+//
+// The changes here are meant to be work in conjunction with admission control.
+// After admission is granted, we have a classification on whether the work
+// is elastic or not. Regular work continues as usual. Elastic work does:
+//   func() {
+//     SetGoroutineAsElastic(true)
+//     defer SetGoroutineAsElastic(false)
+//     runtime.Gosched()
+//     ... do work, with calls to runtime.Gosched() at 2ms intervals ...
+//   }()
+// The expectation here is that:
+// - Elastic goroutines are additive to regular goroutines in the runnable
+//   queues in the goroutine scheduler, i.e., they are not perturbing how the
+//   regular goroutines are distributed across the runnable queues when there
+//   were no elastic G's.
+//   TODO(sumeer): this assumption needs to be validated based on more code
+//   reading -- e.g. which queue does a newly created G get added to?.
+//
+// - Whenever a runnable G is being picked for a P from one of these queues, a
+//   regular G will be preferred.
+//
+// - If an elastic G starts running because there were no regular G's, and
+//   regular G's arrive immediately after the elastic G starts running, the
+//   regular G's will not need to wait for the full forcePreemptNS = 10ms.
+//
+// - An elastic G will not be starved forever, since admission control only
+//   admits elastic G's when the CPU utilization is < 95%, so there will be
+//   idle time where an already admitted elastic G will get to run.
+//
+// Risks:
+// - Priority inversion caused by elastic goroutines holding mutexes or
+//   CockroachDB latches.
+
+// runq seems to be single producer, multi-consumer. Multi-consumer since
+// others can steal. tail is only modified using StoreRel. head requires a CasRel.
+// runnext seems to be similar in behavior due to the comment "Note that while
+// other P's may atomically CAS this to zero, only the owner P can CAS it to a
+// valid G.
+// So what is the correctness of runqempty, given that the code comment says
+// "It never returns true spuriously"?:
+// A. If being run by the owner P: should not return true if owner P or others have
+//   not already emptied the runq.
+// B. If not being run by owner P: if returns true and owner P adds something concurrently
+//   we can have
+//
+// The code comment also suggests it can run concurrently with runqput, and
+// runqget, so it must be case B.
+
+// TODO: change the signature of some of the gQueue methods to take 2 gQueues.

@@ -2327,6 +2327,9 @@ func startm(_p_ *p, spinning bool) {
 	if nmp.nextp != 0 {
 		throw("startm: m has p")
 	}
+	// TODO(sumeer): is there a race here for which we need to ensure that
+	// runqempty does not spuriously return true? Seems not, because
+	// spuriously returning false is the invariant violation.
 	if spinning && !runqempty(_p_) {
 		throw("startm: p has runnable gs")
 	}
@@ -2347,8 +2350,12 @@ func handoffp(_p_ *p) {
 	// handoffp must start an M in any situation where
 	// findrunnable would return a G to run on _p_.
 
-	// if it has local work, start it straight away
-	if !runqempty(_p_) || sched.runqsize != 0 {
+	// if it has local work, start it straight away.
+	// TODO(sumeer): I suspect that _p_ is not doing anything concurrently
+	// here, so there is no race with things being added to _p_'s runq
+	// concurrently.
+	if !runqempty(_p_) || sched.runqstate[regularGClass].qsize != 0 ||
+		sched.runqstate[elasticGClass].qsize != 0 {
 		startm(_p_, false)
 		return
 	}
@@ -2385,7 +2392,7 @@ func handoffp(_p_ *p) {
 			notewakeup(&sched.safePointNote)
 		}
 	}
-	if sched.runqsize != 0 {
+	if sched.runqstate[regularGClass].qsize != 0 || sched.runqstate[elasticGClass].qsize != 0 {
 		unlock(&sched.lock)
 		startm(_p_, false)
 		return
@@ -2594,9 +2601,12 @@ top:
 	// Check the global runnable queue once in a while to ensure fairness.
 	// Otherwise two goroutines can completely occupy the local runqueue
 	// by constantly respawning each other.
-	if _p_.schedtick%61 == 0 && sched.runqsize > 0 {
+	// NB: only get regularGClass from global.
+	if _p_.schedtick%61 == 0 && sched.runqstate[regularGClass].qsize > 0 {
 		lock(&sched.lock)
-		gp = globrunqget(_p_, 1)
+		if sched.runqstate[regularGClass].qsize > 0 {
+			gp = globrunqget(_p_, 1)
+		}
 		unlock(&sched.lock)
 		if gp != nil {
 			return gp, false, false
@@ -2619,7 +2629,7 @@ top:
 	}
 
 	// global runq
-	if sched.runqsize != 0 {
+	if sched.runqstate[regularGClass].qsize != 0 || sched.runqstate[elasticGClass].qsize != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
@@ -2659,20 +2669,24 @@ top:
 			atomic.Xadd(&sched.nmspinning, 1)
 		}
 
-		gp, inheritTime, tnow, w, newWork := stealWork(now)
-		now = tnow
-		if gp != nil {
-			// Successfully stole.
-			return gp, inheritTime, false
-		}
-		if newWork {
-			// There may be new timer or GC work; restart to
-			// discover.
-			goto top
-		}
-		if w != 0 && (pollUntil == 0 || w < pollUntil) {
-			// Earlier timer to wait for.
-			pollUntil = w
+		// First attempt to steal regularGClass, and then elasticGClass.
+		for i := GClass(0); i < numGClasses; i++ {
+			// TODO: need to figure out what to do about inheritTime, w when loop.
+			gp, inheritTime, tnow, w, newWork := stealWork(now, i)
+			now = tnow
+			if gp != nil {
+				// Successfully stole.
+				return gp, inheritTime, false
+			}
+			if newWork {
+				// There may be new timer or GC work; restart to
+				// discover.
+				goto top
+			}
+			if w != 0 && (pollUntil == 0 || w < pollUntil) {
+				// Earlier timer to wait for.
+				pollUntil = w
+			}
 		}
 	}
 
@@ -2726,7 +2740,7 @@ top:
 		unlock(&sched.lock)
 		goto top
 	}
-	if sched.runqsize != 0 {
+	if sched.runqstate[regularGClass].qsize != 0 || sched.runqstate[elasticGClass].qsize != 0 {
 		gp := globrunqget(_p_, 0)
 		unlock(&sched.lock)
 		return gp, false, false
@@ -2872,10 +2886,12 @@ top:
 // background work loops, like idle GC. It checks a subset of the
 // conditions checked by the actual scheduler.
 func pollWork() bool {
-	if sched.runqsize != 0 {
+	if sched.runqstate[regularGClass].qsize != 0 || sched.runqstate[elasticGClass].qsize != 0 {
 		return true
 	}
 	p := getg().m.p.ptr()
+	// TODO(sumeer): I suspect that p is not doing anything concurrently here,
+	// so there is no race with things being added to p's runq concurrently.
 	if !runqempty(p) {
 		return true
 	}
@@ -2894,7 +2910,7 @@ func pollWork() bool {
 //
 // If now is not 0 it is the current time. stealWork returns the passed time or
 // the current time if now was passed as 0.
-func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
+func stealWork(now int64, gclass GClass) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
 	pp := getg().m.p.ptr()
 
 	ranTimer := false
@@ -2950,7 +2966,7 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 
 			// Don't bother to attempt to steal if p2 is idle.
 			if !idlepMask.read(enum.position()) {
-				if gp := runqsteal(pp, p2, stealTimersOrRunNextG); gp != nil {
+				if gp := runqsteal(pp, p2, stealTimersOrRunNextG, gclass); gp != nil {
 					return gp, false, now, pollUntil, ranTimer
 				}
 			}
@@ -2970,6 +2986,10 @@ func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWo
 // work to.
 func checkRunqsNoP(allpSnapshot []*p, idlepMaskSnapshot pMask) *p {
 	for id, p2 := range allpSnapshot {
+		// TODO(sumeer): p2 could be stealing work from other runq's or the
+		// global q concurrently. So the !runqempty is not necessarily
+		// accurate -- it could be empty when runqempty returns and then
+		// transition to non-empty.
 		if !idlepMaskSnapshot.read(uint32(id)) && !runqempty(p2) {
 			lock(&sched.lock)
 			pp, _ := pidleget(0)
@@ -3121,20 +3141,36 @@ func injectglist(glist *gList) {
 	}
 
 	// Mark all the goroutines as runnable before we put them
-	// on the run queues.
-	head := glist.head.ptr()
-	var tail *g
-	qsize := 0
-	for gp := head; gp != nil; gp = gp.schedlink.ptr() {
-		tail = gp
-		qsize++
-		casgstatus(gp, _Gwaiting, _Grunnable)
-	}
+	// on the run queues. And split into gQueues based on the gClass.
 
-	// Turn the gList into a gQueue.
-	var q gQueue
-	q.head.set(head)
-	q.tail.set(tail)
+	head := glist.head.ptr()
+	var q [numGClasses]struct {
+		q     gQueue
+		qSize int
+		head  *g
+		tail  *g
+	}
+	for gp := head; gp != nil; {
+		gclass := gp.gClass
+		q[gclass].qSize++
+		if q[gclass].head == nil {
+			q[gclass].head = gp
+		} else {
+			q[gclass].tail.schedlink.set(gp)
+		}
+		q[gclass].tail = gp
+		casgstatus(gp, _Gwaiting, _Grunnable)
+		next := gp.schedlink.ptr()
+		gp.schedlink.set(nil)
+		gp = next
+	}
+	// Turn into gQueues.
+	for i := range q {
+		if q[i].qSize > 0 {
+			q[i].q.head.set(q[i].head)
+			q[i].q.tail.set(q[i].tail)
+		}
+	}
 	*glist = gList{}
 
 	startIdle := func(n int) {
@@ -3146,29 +3182,44 @@ func injectglist(glist *gList) {
 	pp := getg().m.p.ptr()
 	if pp == nil {
 		lock(&sched.lock)
-		globrunqputbatch(&q, int32(qsize))
+		qSize := 0
+		for i := range q {
+			if q[i].qSize > 0 {
+				globrunqputbatch(&q[i].q, int32(q[i].qSize), GClass(i))
+				qSize += q[i].qSize
+			}
+		}
 		unlock(&sched.lock)
-		startIdle(qsize)
+		startIdle(qSize)
 		return
 	}
 
 	npidle := int(atomic.Load(&sched.npidle))
-	var globq gQueue
-	var n int
-	for n = 0; n < npidle && !q.empty(); n++ {
-		g := q.pop()
-		globq.pushBack(g)
-	}
-	if n > 0 {
-		lock(&sched.lock)
-		globrunqputbatch(&globq, int32(n))
-		unlock(&sched.lock)
-		startIdle(n)
-		qsize -= n
+	for i := range q {
+		var globq gQueue
+		var n int
+		for npidle > 0 && !q[i].q.empty() {
+			g := q[i].q.pop()
+			globq.pushBack(g)
+			npidle--
+			n++
+		}
+		if n > 0 {
+			lock(&sched.lock)
+			globrunqputbatch(&globq, int32(n), GClass(i))
+			unlock(&sched.lock)
+			startIdle(n)
+			q[i].qSize -= n
+		}
+		if npidle == 0 {
+			break
+		}
 	}
 
-	if !q.empty() {
-		runqputbatch(pp, &q, qsize)
+	for i := range q {
+		if !q[i].q.empty() {
+			runqputbatch(pp, &q[i].q, q[i].qSize, GClass(i))
+		}
 	}
 }
 
@@ -3199,7 +3250,9 @@ top:
 	// Safety check: if we are spinning, the run queue should be empty.
 	// Check this before calling checkTimers, as that might call
 	// goready to put a ready goroutine on the local run queue.
-	if _g_.m.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
+	if _g_.m.spinning && (pp.runnext != 0 ||
+		pp.runqstate[regularGClass].head != pp.runqstate[regularGClass].tail ||
+		pp.runqstate[elasticGClass].head != pp.runqstate[elasticGClass].tail) {
 		throw("schedule: spinning with local work")
 	}
 
@@ -3222,7 +3275,7 @@ top:
 			// were acquiring the lock.
 			unlock(&sched.lock)
 		} else {
-			sched.disable.runnable.pushBack(gp)
+			sched.disable.runnable[gp.gClass].pushBack(gp)
 			sched.disable.n++
 			unlock(&sched.lock)
 			goto top
@@ -4705,12 +4758,14 @@ func (pp *p) destroy() {
 	assertWorldStopped()
 
 	// Move all runnable goroutines to the global queue
-	for pp.runqhead != pp.runqtail {
-		// Pop from tail of local queue
-		pp.runqtail--
-		gp := pp.runq[pp.runqtail%uint32(len(pp.runq))].ptr()
-		// Push onto head of global queue
-		globrunqputhead(gp)
+	for i := range pp.runqstate {
+		for pp.runqstate[i].head != pp.runqstate[i].tail {
+			// Pop from tail of local queue
+			pp.runqstate[i].tail--
+			gp := pp.runqstate[i].q[pp.runqstate[i].tail%prunqlen].ptr()
+			// Push onto tail of global queue.
+			globrunqput(gp)
+		}
 	}
 	if pp.runnext != 0 {
 		globrunqputhead(pp.runnext.ptr())
@@ -4909,6 +4964,9 @@ func procresize(nprocs int32) *p {
 			continue
 		}
 		p.status = _Pidle
+		// TODO(sumeer): I suspect that p is not doing anything concurrently
+		// here, since the world is stopped, so there is no race with things
+		// being added to p's runq concurrently.
 		if runqempty(p) {
 			pidleput(p, now)
 		} else {
@@ -5322,6 +5380,7 @@ func retake(now int64) uint32 {
 			// On the one hand we don't want to retake Ps if there is no other work to do,
 			// but on the other hand we want to retake them eventually
 			// because they can prevent the sysmon thread from deep sleep.
+			// TODO(sumeer): is there a race here with _p_ adding to its runq?
 			if runqempty(_p_) && atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) > 0 && pd.syscallwhen+10*1000*1000 > now {
 				continue
 			}
@@ -5413,7 +5472,8 @@ func schedtrace(detailed bool) {
 	}
 
 	lock(&sched.lock)
-	print("SCHED ", (now-starttime)/1e6, "ms: gomaxprocs=", gomaxprocs, " idleprocs=", sched.npidle, " threads=", mcount(), " spinningthreads=", sched.nmspinning, " idlethreads=", sched.nmidle, " runqueue=", sched.runqsize)
+	// TODO(sumeer): also print elasticGClass qsize.
+	print("SCHED ", (now-starttime)/1e6, "ms: gomaxprocs=", gomaxprocs, " idleprocs=", sched.npidle, " threads=", mcount(), " spinningthreads=", sched.nmspinning, " idlethreads=", sched.nmidle, " runqueue=", sched.runqstate[regularGClass].qsize)
 	if detailed {
 		print(" gcwaiting=", sched.gcwaiting, " nmidlelocked=", sched.nmidlelocked, " stopwait=", sched.stopwait, " sysmonwait=", sched.sysmonwait, "\n")
 	}
@@ -5422,8 +5482,9 @@ func schedtrace(detailed bool) {
 	// E.g. (p->m ? p->m->id : -1) can crash if p->m changes from non-nil to nil.
 	for i, _p_ := range allp {
 		mp := _p_.m.ptr()
-		h := atomic.Load(&_p_.runqhead)
-		t := atomic.Load(&_p_.runqtail)
+		// TODO(sumeer): also look at elasticGClass.
+		h := atomic.Load(&_p_.runqstate[regularGClass].head)
+		t := atomic.Load(&_p_.runqstate[regularGClass].tail)
 		if detailed {
 			id := int64(-1)
 			if mp != nil {
@@ -5499,7 +5560,9 @@ func schedEnableUser(enable bool) {
 	if enable {
 		n := sched.disable.n
 		sched.disable.n = 0
-		globrunqputbatch(&sched.disable.runnable, n)
+		for i := range sched.disable.runnable {
+			globrunqputbatch(&sched.disable.runnable[i], n, GClass(i))
+		}
 		unlock(&sched.lock)
 		for ; n != 0 && sched.npidle != 0; n-- {
 			startm(nil, false)
@@ -5560,8 +5623,9 @@ func mget() *m {
 func globrunqput(gp *g) {
 	assertLockHeld(&sched.lock)
 
-	sched.runq.pushBack(gp)
-	sched.runqsize++
+	gclass := gp.gClass
+	sched.runqstate[gclass].q.pushBack(gp)
+	sched.runqstate[gclass].qsize++
 }
 
 // Put gp at the head of the global runnable queue.
@@ -5572,8 +5636,9 @@ func globrunqput(gp *g) {
 func globrunqputhead(gp *g) {
 	assertLockHeld(&sched.lock)
 
-	sched.runq.push(gp)
-	sched.runqsize++
+	gclass := gp.gClass
+	sched.runqstate[gclass].q.push(gp)
+	sched.runqstate[gclass].qsize++
 }
 
 // Put a batch of runnable goroutines on the global runnable queue.
@@ -5582,11 +5647,20 @@ func globrunqputhead(gp *g) {
 // May run during STW, so write barriers are not allowed.
 //
 //go:nowritebarrierrec
-func globrunqputbatch(batch *gQueue, n int32) {
+func globrunqputbatch(batch *gQueue, n int32, gclass GClass) {
 	assertLockHeld(&sched.lock)
-
-	sched.runq.pushBackAll(*batch)
-	sched.runqsize += n
+	/*
+		size := 0
+		for gp := batch.head.ptr(); gp != nil; gp = gp.schedlink.ptr() {
+			size++
+		}
+		if size != int(n) {
+			print("mismatched sizes: ", size, "!=", n)
+			throw("mismatched sizes")
+		}
+	*/
+	sched.runqstate[gclass].q.pushBackAll(*batch)
+	sched.runqstate[gclass].qsize += n
 	*batch = gQueue{}
 }
 
@@ -5595,28 +5669,41 @@ func globrunqputbatch(batch *gQueue, n int32) {
 func globrunqget(_p_ *p, max int32) *g {
 	assertLockHeld(&sched.lock)
 
-	if sched.runqsize == 0 {
-		return nil
-	}
+	var gp *g
+	for i := range sched.runqstate {
+		if sched.runqstate[i].qsize == 0 {
+			continue
+		}
 
-	n := sched.runqsize/gomaxprocs + 1
-	if n > sched.runqsize {
-		n = sched.runqsize
-	}
-	if max > 0 && n > max {
-		n = max
-	}
-	if n > int32(len(_p_.runq))/2 {
-		n = int32(len(_p_.runq)) / 2
-	}
-
-	sched.runqsize -= n
-
-	gp := sched.runq.pop()
-	n--
-	for ; n > 0; n-- {
-		gp1 := sched.runq.pop()
-		runqput(_p_, gp1, false)
+		n := sched.runqstate[i].qsize/gomaxprocs + 1
+		if n > sched.runqstate[i].qsize {
+			n = sched.runqstate[i].qsize
+		}
+		if max > 0 && n > max {
+			n = max
+		}
+		if n > int32(prunqlen)/2 {
+			n = int32(prunqlen) / 2
+		}
+		added := n
+		sched.runqstate[i].qsize -= n
+		if gp == nil {
+			gp = sched.runqstate[i].q.pop()
+			n--
+		}
+		for ; n > 0; n-- {
+			gp1 := sched.runqstate[i].q.pop()
+			runqput(_p_, gp1, false)
+		}
+		if max > 0 {
+			max -= added
+			if max < 0 {
+				throw("bug: exceeded max")
+			}
+			if max == 0 {
+				break
+			}
+		}
 	}
 	return gp
 }
@@ -5699,6 +5786,9 @@ func updateTimerPMask(pp *p) {
 func pidleput(_p_ *p, now int64) int64 {
 	assertLockHeld(&sched.lock)
 
+	// TODO(sumeer): I suspect that _p_ is not doing anything concurrently
+	// here, so there is no race with things being added to _p_'s runq
+	// concurrently.
 	if !runqempty(_p_) {
 		throw("pidleput: P has non-empty run queue")
 	}
@@ -5743,18 +5833,57 @@ func pidleget(now int64) (*p, int64) {
 
 // runqempty reports whether _p_ has no Gs on its local run queue.
 // It never returns true spuriously.
+
+// TODO(sumeer):
+// runq seems to be single producer, multi-consumer. Multi-consumer since
+// others can steal. tail is only modified using StoreRel. head requires a CasRel.
+// runnext seems to be similar in behavior due to the comment "Note that while
+// other P's may atomically CAS this to zero, only the owner P can CAS it to a
+// valid G.
+// So what is the correctness of runqempty, given that the code comment says
+// "It never returns true spuriously"?:
+// A. If being run by the owner P: should not return true if owner P or others have
+//   not already emptied the runq.
+// B. If not being run by owner P: if returns true and owner P adds something concurrently
+//   we cannot make any correctness guarantees.
+//
+// The code comment also suggests it can run concurrently with runqput, and
+// runqget, so it must be case B? Or is there a subcase of A where there can
+// be concurrent activity by P, but not stealing activity by P to add to the
+// runq?
+// We assume that the only concurrent activities we need to tolerate are g's
+// moving around in the queues and runnext, and the P taking what it is
+// running and placing it one of these. We can't handle the case where a g has
+// been popped from one of the runq's and will be pushed onto a different one
+// -- presumably we don't need to since this P should be able to run it.
 func runqempty(_p_ *p) bool {
 	// Defend against a race where 1) _p_ has G1 in runqnext but runqhead == runqtail,
 	// 2) runqput on _p_ kicks G1 to the runq, 3) runqget on _p_ empties runqnext.
 	// Simply observing that runqhead == runqtail and then observing that runqnext == nil
 	// does not mean the queue is empty.
 	for {
-		head := atomic.Load(&_p_.runqhead)
-		tail := atomic.Load(&_p_.runqtail)
+		// Load queues to check that they were empty to begin with.
+		headRegular := atomic.Load(&_p_.runqstate[regularGClass].head)
+		tailRegular := atomic.Load(&_p_.runqstate[regularGClass].tail)
+		headElastic := atomic.Load(&_p_.runqstate[elasticGClass].head)
+		tailElastic := atomic.Load(&_p_.runqstate[elasticGClass].tail)
+		// Load runnext to check that it is empty. Between the previous step
+		// and this step, it may have kicked something into the queues.
 		runnext := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&_p_.runnext)))
-		if tail == atomic.Load(&_p_.runqtail) {
-			return head == tail && runnext == 0
+		// Can produce an authoritative result only if the tails have not changed,
+		// which means no one has pushed onto the queues.
+		if tailRegular == atomic.Load(&_p_.runqstate[regularGClass].tail) &&
+			tailElastic == atomic.Load(&_p_.runqstate[elasticGClass].tail) {
+			return headRegular == tailRegular && headElastic == tailElastic && runnext == 0
 		}
+		/*
+			head := atomic.Load(&_p_.runqhead)
+			tail := atomic.Load(&_p_.runqtail)
+			runnext := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&_p_.runnext)))
+			if tail == atomic.Load(&_p_.runqtail) {
+				return head == tail && runnext == 0
+			}
+		*/
 	}
 }
 
@@ -5792,15 +5921,19 @@ func runqput(_p_ *p, gp *g, next bool) {
 		gp = oldnext.ptr()
 	}
 
+	if gp == nil {
+		throw("unexpected that gp is nil in runqput")
+	}
+	gclass := gp.gClass
 retry:
-	h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with consumers
-	t := _p_.runqtail
-	if t-h < uint32(len(_p_.runq)) {
-		_p_.runq[t%uint32(len(_p_.runq))].set(gp)
-		atomic.StoreRel(&_p_.runqtail, t+1) // store-release, makes the item available for consumption
+	h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with consumers
+	t := _p_.runqstate[gclass].tail
+	if t-h < prunqlen {
+		_p_.runqstate[gclass].q[t%prunqlen].set(gp)
+		atomic.StoreRel(&_p_.runqstate[gclass].tail, t+1) // store-release, makes the item available for consumption
 		return
 	}
-	if runqputslow(_p_, gp, h, t) {
+	if runqputslow(_p_, gp, h, t, gclass) {
 		return
 	}
 	// the queue is not full, now the put above must succeed
@@ -5809,19 +5942,19 @@ retry:
 
 // Put g and a batch of work from local runnable queue on global queue.
 // Executed only by the owner P.
-func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
-	var batch [len(_p_.runq)/2 + 1]*g
+func runqputslow(_p_ *p, gp *g, h, t uint32, gclass GClass) bool {
+	var batch [prunqlen/2 + 1]*g
 
 	// First, grab a batch from local queue.
 	n := t - h
 	n = n / 2
-	if n != uint32(len(_p_.runq)/2) {
+	if n != prunqlen/2 {
 		throw("runqputslow: queue is not full")
 	}
 	for i := uint32(0); i < n; i++ {
-		batch[i] = _p_.runq[(h+i)%uint32(len(_p_.runq))].ptr()
+		batch[i] = _p_.runqstate[gclass].q[(h+i)%prunqlen].ptr()
 	}
-	if !atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
+	if !atomic.CasRel(&_p_.runqstate[gclass].head, h, h+n) { // cas-release, commits consume
 		return false
 	}
 	batch[n] = gp
@@ -5843,7 +5976,7 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 
 	// Now put the batch on global queue.
 	lock(&sched.lock)
-	globrunqputbatch(&q, int32(n+1))
+	globrunqputbatch(&q, int32(n+1), gclass)
 	unlock(&sched.lock)
 	return true
 }
@@ -5852,13 +5985,22 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 // If the queue is full, they are put on the global queue; in that case
 // this will temporarily acquire the scheduler lock.
 // Executed only by the owner P.
-func runqputbatch(pp *p, q *gQueue, qsize int) {
-	h := atomic.LoadAcq(&pp.runqhead)
-	t := pp.runqtail
+func runqputbatch(pp *p, q *gQueue, qsize int, gclass GClass) {
+	h := atomic.LoadAcq(&pp.runqstate[gclass].head)
+	t := pp.runqstate[gclass].tail
 	n := uint32(0)
-	for !q.empty() && t-h < uint32(len(pp.runq)) {
+	size := 0
+	for gp := q.head.ptr(); gp != nil; gp = gp.schedlink.ptr() {
+		size++
+	}
+	if size != qsize {
+		print("mismatched sizes: ", size, "!=", qsize)
+		throw("mismatched sizes")
+	}
+
+	for !q.empty() && t-h < prunqlen {
 		gp := q.pop()
-		pp.runq[t%uint32(len(pp.runq))].set(gp)
+		pp.runqstate[gclass].q[t%prunqlen].set(gp)
 		t++
 		n++
 	}
@@ -5866,18 +6008,19 @@ func runqputbatch(pp *p, q *gQueue, qsize int) {
 
 	if randomizeScheduler {
 		off := func(o uint32) uint32 {
-			return (pp.runqtail + o) % uint32(len(pp.runq))
+			return (pp.runqstate[gclass].tail + o) % prunqlen
 		}
 		for i := uint32(1); i < n; i++ {
 			j := fastrandn(i + 1)
-			pp.runq[off(i)], pp.runq[off(j)] = pp.runq[off(j)], pp.runq[off(i)]
+			pp.runqstate[gclass].q[off(i)], pp.runqstate[gclass].q[off(j)] =
+				pp.runqstate[gclass].q[off(j)], pp.runqstate[gclass].q[off(i)]
 		}
 	}
 
-	atomic.StoreRel(&pp.runqtail, t)
+	atomic.StoreRel(&pp.runqstate[gclass].tail, t)
 	if !q.empty() {
 		lock(&sched.lock)
-		globrunqputbatch(q, int32(qsize))
+		globrunqputbatch(q, int32(qsize), gclass)
 		unlock(&sched.lock)
 	}
 }
@@ -5896,54 +6039,65 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 		return next.ptr(), true
 	}
 
-	for {
-		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
-		t := _p_.runqtail
-		if t == h {
-			return nil, false
-		}
-		gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
-		if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
-			return gp, false
+	// It is possible for runqget to miss a g that was added after this loop
+	// started. But presumably because the code below does not atomically load
+	// tail, it is not concerned with concurrent producers to these queues.
+	// Since runqget is run only the owner P we are willing to run both
+	// regularGClass and elasticGClass, in that order.
+	for i := range _p_.runqstate {
+		for {
+			h := atomic.LoadAcq(&_p_.runqstate[i].head) // load-acquire, synchronize with other consumers
+			t := _p_.runqstate[i].tail
+			if t == h {
+				return nil, false
+			}
+			gp := _p_.runqstate[i].q[h%prunqlen].ptr()
+			if atomic.CasRel(&_p_.runqstate[i].head, h, h+1) { // cas-release, commits consume
+				return gp, false
+			}
 		}
 	}
+	return nil, false
 }
 
 // runqdrain drains the local runnable queue of _p_ and returns all goroutines in it.
 // Executed only by the owner P.
-func runqdrain(_p_ *p) (drainQ gQueue, n uint32) {
+func runqdrain(_p_ *p) (drainQ [numGClasses]gQueue, n [numGClasses]uint32) {
 	oldNext := _p_.runnext
 	if oldNext != 0 && _p_.runnext.cas(oldNext, 0) {
-		drainQ.pushBack(oldNext.ptr())
-		n++
+		gclass := oldNext.ptr().gClass
+		drainQ[gclass].pushBack(oldNext.ptr())
+		n[gclass]++
 	}
 
-retry:
-	h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
-	t := _p_.runqtail
-	qn := t - h
-	if qn == 0 {
-		return
-	}
-	if qn > uint32(len(_p_.runq)) { // read inconsistent h and t
-		goto retry
-	}
+	for gclass := range _p_.runqstate {
+	retry:
+		h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with other consumers
+		t := _p_.runqstate[gclass].tail
+		qn := t - h
+		if qn == 0 {
+			continue
+		}
+		if qn > prunqlen { // read inconsistent h and t
+			goto retry
+		}
 
-	if !atomic.CasRel(&_p_.runqhead, h, h+qn) { // cas-release, commits consume
-		goto retry
-	}
+		if !atomic.CasRel(&_p_.runqstate[gclass].head, h, h+qn) { // cas-release, commits consume
+			goto retry
+		}
 
-	// We've inverted the order in which it gets G's from the local P's runnable queue
-	// and then advances the head pointer because we don't want to mess up the statuses of G's
-	// while runqdrain() and runqsteal() are running in parallel.
-	// Thus we should advance the head pointer before draining the local P into a gQueue,
-	// so that we can update any gp.schedlink only after we take the full ownership of G,
-	// meanwhile, other P's can't access to all G's in local P's runnable queue and steal them.
-	// See https://groups.google.com/g/golang-dev/c/0pTKxEKhHSc/m/6Q85QjdVBQAJ for more details.
-	for i := uint32(0); i < qn; i++ {
-		gp := _p_.runq[(h+i)%uint32(len(_p_.runq))].ptr()
-		drainQ.pushBack(gp)
-		n++
+		// We've inverted the order in which it gets G's from the local P's runnable queue
+		// and then advances the head pointer because we don't want to mess up the statuses of G's
+		// while runqdrain() and runqsteal() are running in parallel.
+		// Thus we should advance the head pointer before draining the local P into a gQueue,
+		// so that we can update any gp.schedlink only after we take the full ownership of G,
+		// meanwhile, other P's can't access to all G's in local P's runnable queue and steal them.
+		// See https://groups.google.com/g/golang-dev/c/0pTKxEKhHSc/m/6Q85QjdVBQAJ for more details.
+		for i := uint32(0); i < qn; i++ {
+			gp := _p_.runqstate[i].q[(h+i)%prunqlen].ptr()
+			drainQ[gclass].pushBack(gp)
+		}
+		n[gclass] += qn
 	}
 	return
 }
@@ -5952,10 +6106,10 @@ retry:
 // Batch is a ring buffer starting at batchHead.
 // Returns number of grabbed goroutines.
 // Can be executed by any P.
-func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool, gclass GClass) uint32 {
 	for {
-		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
-		t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
+		h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with other consumers
+		t := atomic.LoadAcq(&_p_.runqstate[gclass].tail) // load-acquire, synchronize with the producer
 		n := t - h
 		n = n - n/2
 		if n == 0 {
@@ -5991,14 +6145,14 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 			}
 			return 0
 		}
-		if n > uint32(len(_p_.runq)/2) { // read inconsistent h and t
+		if n > prunqlen/2 { // read inconsistent h and t
 			continue
 		}
 		for i := uint32(0); i < n; i++ {
-			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
+			g := _p_.runqstate[gclass].q[(h+i)%prunqlen]
 			batch[(batchHead+i)%uint32(len(batch))] = g
 		}
-		if atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
+		if atomic.CasRel(&_p_.runqstate[gclass].head, h, h+n) { // cas-release, commits consume
 			return n
 		}
 	}
@@ -6007,22 +6161,22 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 // Steal half of elements from local runnable queue of p2
 // and put onto local runnable queue of p.
 // Returns one of the stolen elements (or nil if failed).
-func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
-	t := _p_.runqtail
-	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
+func runqsteal(_p_, p2 *p, stealRunNextG bool, gclass GClass) *g {
+	t := _p_.runqstate[gclass].tail
+	n := runqgrab(p2, &_p_.runqstate[gclass].q, t, stealRunNextG, gclass)
 	if n == 0 {
 		return nil
 	}
 	n--
-	gp := _p_.runq[(t+n)%uint32(len(_p_.runq))].ptr()
+	gp := _p_.runqstate[gclass].q[(t+n)%prunqlen].ptr()
 	if n == 0 {
 		return gp
 	}
-	h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with consumers
-	if t-h+n >= uint32(len(_p_.runq)) {
+	h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with consumers
+	if t-h+n >= prunqlen {
 		throw("runqsteal: runq overflow")
 	}
-	atomic.StoreRel(&_p_.runqtail, t+n) // store-release, makes the item available for consumption
+	atomic.StoreRel(&_p_.runqstate[gclass].tail, t+n) // store-release, makes the item available for consumption
 	return gp
 }
 
@@ -6193,6 +6347,9 @@ func sync_runtime_canSpin(i int) bool {
 	if i >= active_spin || ncpu <= 1 || gomaxprocs <= int32(sched.npidle+sched.nmspinning)+1 {
 		return false
 	}
+	// TODO(sumeer): If spuriously return true from runqempty due to a race,
+	// we will return true below to spin. That is fine, since spinning is
+	// bounded.
 	if p := getg().m.p.ptr(); !runqempty(p) {
 		return false
 	}
@@ -6339,5 +6496,15 @@ func doInit(t *initTask) {
 		}
 
 		t.state = 2 // initialization done
+	}
+}
+
+func SetGoroutineAsElastic(elastic bool) {
+	g := getg()
+	switch elastic {
+	case false:
+		g.gClass = regularGClass
+	case true:
+		g.gClass = elasticGClass
 	}
 }
