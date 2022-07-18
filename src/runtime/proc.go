@@ -2669,24 +2669,20 @@ top:
 			atomic.Xadd(&sched.nmspinning, 1)
 		}
 
-		// First attempt to steal regularGClass, and then elasticGClass.
-		for i := GClass(0); i < numGClasses; i++ {
-			// TODO: need to figure out what to do about inheritTime, w when loop.
-			gp, inheritTime, tnow, w, newWork := stealWork(now, i)
-			now = tnow
-			if gp != nil {
-				// Successfully stole.
-				return gp, inheritTime, false
-			}
-			if newWork {
-				// There may be new timer or GC work; restart to
-				// discover.
-				goto top
-			}
-			if w != 0 && (pollUntil == 0 || w < pollUntil) {
-				// Earlier timer to wait for.
-				pollUntil = w
-			}
+		gp, inheritTime, tnow, w, newWork := stealWork(now)
+		now = tnow
+		if gp != nil {
+			// Successfully stole.
+			return gp, inheritTime, false
+		}
+		if newWork {
+			// There may be new timer or GC work; restart to
+			// discover.
+			goto top
+		}
+		if w != 0 && (pollUntil == 0 || w < pollUntil) {
+			// Earlier timer to wait for.
+			pollUntil = w
 		}
 	}
 
@@ -2910,7 +2906,7 @@ func pollWork() bool {
 //
 // If now is not 0 it is the current time. stealWork returns the passed time or
 // the current time if now was passed as 0.
-func stealWork(now int64, gclass GClass) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
+func stealWork(now int64) (gp *g, inheritTime bool, rnow, pollUntil int64, newWork bool) {
 	pp := getg().m.p.ptr()
 
 	ranTimer := false
@@ -2966,8 +2962,10 @@ func stealWork(now int64, gclass GClass) (gp *g, inheritTime bool, rnow, pollUnt
 
 			// Don't bother to attempt to steal if p2 is idle.
 			if !idlepMask.read(enum.position()) {
-				if gp := runqsteal(pp, p2, stealTimersOrRunNextG, gclass); gp != nil {
-					return gp, false, now, pollUntil, ranTimer
+				for gclass := GClass(0); gclass < numGClasses; gclass++ {
+					if gp := runqsteal(pp, p2, stealTimersOrRunNextG, gclass); gp != nil {
+						return gp, false, now, pollUntil, ranTimer
+					}
 				}
 			}
 		}
@@ -4757,6 +4755,7 @@ func (pp *p) destroy() {
 	assertLockHeld(&sched.lock)
 	assertWorldStopped()
 
+	print("destroy for p ", pp.id, "\n")
 	// Move all runnable goroutines to the global queue
 	for i := range pp.runqstate {
 		for pp.runqstate[i].head != pp.runqstate[i].tail {
@@ -5835,6 +5834,8 @@ func pidleget(now int64) (*p, int64) {
 // It never returns true spuriously.
 
 // TODO(sumeer):
+// - read https://github.com/golang/go/blob/master/src/runtime/HACKING.md#getg-and-getgmcurg
+// - and subtleties mentioned in https://www.datadoghq.com/blog/engineering/profiling-improvements-in-go-1-18/#profiler-label-bug-fixes
 // runq seems to be single producer, multi-consumer. Multi-consumer since
 // others can steal. tail is only modified using StoreRel. head requires a CasRel.
 // runnext seems to be similar in behavior due to the comment "Note that while
@@ -5929,6 +5930,8 @@ retry:
 	h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with consumers
 	t := _p_.runqstate[gclass].tail
 	if t-h < prunqlen {
+		print("runqput setting for p ", _p_.id, " at ", t, "=",
+			guintptr(unsafe.Pointer(gp)), " gclass:", gclass, "\n")
 		_p_.runqstate[gclass].q[t%prunqlen].set(gp)
 		atomic.StoreRel(&_p_.runqstate[gclass].tail, t+1) // store-release, makes the item available for consumption
 		return
@@ -5951,12 +5954,14 @@ func runqputslow(_p_ *p, gp *g, h, t uint32, gclass GClass) bool {
 	if n != prunqlen/2 {
 		throw("runqputslow: queue is not full")
 	}
+	print("runqputslow taking from p ", _p_.id, " [", h, ",", h+n, ")\n")
 	for i := uint32(0); i < n; i++ {
 		batch[i] = _p_.runqstate[gclass].q[(h+i)%prunqlen].ptr()
 	}
 	if !atomic.CasRel(&_p_.runqstate[gclass].head, h, h+n) { // cas-release, commits consume
 		return false
 	}
+	print("runqputslow taking from p ", _p_.id, " succeeded\n")
 	batch[n] = gp
 
 	if randomizeScheduler {
@@ -5994,12 +5999,17 @@ func runqputbatch(pp *p, q *gQueue, qsize int, gclass GClass) {
 		size++
 	}
 	if size != qsize {
-		print("mismatched sizes: ", size, "!=", qsize)
+		print("mismatched sizes: ", size, "!=", qsize, "\n")
 		throw("mismatched sizes")
 	}
 
 	for !q.empty() && t-h < prunqlen {
 		gp := q.pop()
+		if gp == nil {
+			throw("runqputbatch found nil gp")
+		}
+		print("runqputbatch setting for p ", pp.id, " at ", t, "=",
+			guintptr(unsafe.Pointer(gp)), " gclass:", gclass, "\n")
 		pp.runqstate[gclass].q[t%prunqlen].set(gp)
 		t++
 		n++
@@ -6051,8 +6061,10 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 			if t == h {
 				return nil, false
 			}
+			print("runqget for p ", _p_.id, " at ", h, "=", _p_.runqstate[i].q[h%prunqlen], "\n")
 			gp := _p_.runqstate[i].q[h%prunqlen].ptr()
 			if atomic.CasRel(&_p_.runqstate[i].head, h, h+1) { // cas-release, commits consume
+				print("runqget for p ", _p_.id, " at ", h, " succeeded\n")
 				return gp, false
 			}
 		}
@@ -6085,7 +6097,7 @@ func runqdrain(_p_ *p) (drainQ [numGClasses]gQueue, n [numGClasses]uint32) {
 		if !atomic.CasRel(&_p_.runqstate[gclass].head, h, h+qn) { // cas-release, commits consume
 			goto retry
 		}
-
+		print("runqdrain for p ", _p_.id, " from [", h, ",", t, ") gclass:", gclass, "\n")
 		// We've inverted the order in which it gets G's from the local P's runnable queue
 		// and then advances the head pointer because we don't want to mess up the statuses of G's
 		// while runqdrain() and runqsteal() are running in parallel.
@@ -6094,7 +6106,13 @@ func runqdrain(_p_ *p) (drainQ [numGClasses]gQueue, n [numGClasses]uint32) {
 		// meanwhile, other P's can't access to all G's in local P's runnable queue and steal them.
 		// See https://groups.google.com/g/golang-dev/c/0pTKxEKhHSc/m/6Q85QjdVBQAJ for more details.
 		for i := uint32(0); i < qn; i++ {
-			gp := _p_.runqstate[i].q[(h+i)%prunqlen].ptr()
+			guint := _p_.runqstate[i].q[(h+i)%prunqlen]
+			print("runqdrain for p ", _p_.id, " at ", h+i, "=", guint, "\n")
+			gp := guint.ptr()
+			if gp == nil {
+				print("p ", _p_.id, " gp is nil(", guint, ")", ": qn:", qn, " gclass:", gclass, " h:", h, " t:", t, " i:", i, "\n")
+				throw("runqdrain: gp is nil")
+			}
 			drainQ[gclass].pushBack(gp)
 		}
 		n[gclass] += qn
@@ -6106,7 +6124,7 @@ func runqdrain(_p_ *p) (drainQ [numGClasses]gQueue, n [numGClasses]uint32) {
 // Batch is a ring buffer starting at batchHead.
 // Returns number of grabbed goroutines.
 // Can be executed by any P.
-func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool, gclass GClass) uint32 {
+func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool, gclass GClass, pid int32) uint32 {
 	for {
 		h := atomic.LoadAcq(&_p_.runqstate[gclass].head) // load-acquire, synchronize with other consumers
 		t := atomic.LoadAcq(&_p_.runqstate[gclass].tail) // load-acquire, synchronize with the producer
@@ -6150,9 +6168,16 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 		}
 		for i := uint32(0); i < n; i++ {
 			g := _p_.runqstate[gclass].q[(h+i)%prunqlen]
+			print("runqgrab from p ", _p_.id, " at ", h+i, "=", g, "\n")
+			if g.ptr() == nil {
+				throw("runqgrab found nil g")
+			}
+			print("runqgrab setting for p ", pid, " at ", batchHead+i, "=", g,
+				" gclass:", gclass, "\n")
 			batch[(batchHead+i)%uint32(len(batch))] = g
 		}
 		if atomic.CasRel(&_p_.runqstate[gclass].head, h, h+n) { // cas-release, commits consume
+			print("runqgrab from p ", _p_.id, " succeeded n:", n, "\n")
 			return n
 		}
 	}
@@ -6163,7 +6188,7 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 // Returns one of the stolen elements (or nil if failed).
 func runqsteal(_p_, p2 *p, stealRunNextG bool, gclass GClass) *g {
 	t := _p_.runqstate[gclass].tail
-	n := runqgrab(p2, &_p_.runqstate[gclass].q, t, stealRunNextG, gclass)
+	n := runqgrab(p2, &_p_.runqstate[gclass].q, t, stealRunNextG, gclass, _p_.id)
 	if n == 0 {
 		return nil
 	}
@@ -6176,6 +6201,7 @@ func runqsteal(_p_, p2 *p, stealRunNextG bool, gclass GClass) *g {
 	if t-h+n >= prunqlen {
 		throw("runqsteal: runq overflow")
 	}
+	print("runqsteal for p ", _p_.id, " n:", n, " tail:", t+n, "\n")
 	atomic.StoreRel(&_p_.runqstate[gclass].tail, t+n) // store-release, makes the item available for consumption
 	return gp
 }
